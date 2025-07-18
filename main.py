@@ -23,6 +23,9 @@ import requests
 import plotly.express as px
 import plotly.graph_objects as go
 
+# 메모리 관리
+from modules.memory import MemoryManager, force_garbage_collection
+
 # 설정 및 상수
 from config.constants import BOX_RULES, BOX_COST_ORDER, STOCK_THRESHOLDS, BOX_DESCRIPTIONS
 from config.settings import PAGE_CONFIG, REPO_OWNER, REPO_NAME, SHIPMENT_FILE_PATH, BOX_FILE_PATH, STOCK_FILE_PATH
@@ -35,9 +38,6 @@ st.set_page_config(**PAGE_CONFIG)
 
 # UI 스타일 적용
 apply_custom_styles()
-
-# 메모리 관리
-from modules.memory import MemoryManager, force_garbage_collection
 
 # 보안 및 개인정보 보호
 from modules.security import (
