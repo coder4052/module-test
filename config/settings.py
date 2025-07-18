@@ -8,8 +8,9 @@ BOX_FILE_PATH = f"{BASE_DATA_DIR}/박스계산_encrypted.json"
 STOCK_FILE_PATH = f"{BASE_DATA_DIR}/재고현황_encrypted.json"
 
 # 페이지 설정
-st.set_page_config(
-    page_title="서로 출고 현황",
-    page_icon="🎯",
-    layout="wide"
-)
+PAGE_CONFIG = {
+    "page_title": "서로 출고 현황",
+    "page_icon": "🎯",
+    "layout": "wide"
+}
+
