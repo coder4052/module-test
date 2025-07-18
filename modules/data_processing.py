@@ -132,6 +132,10 @@ def standardize_capacity(capacity, for_box=False):
     return capacity
 
 # 📦 박스 계산 함수들
+def standardize_capacity_for_box(capacity):
+    """박스 계산용 용량 표준화 (200ml → 240ml)"""
+    return standardize_capacity(capacity, for_box=True)
+
 def group_orders_by_recipient(df):
     """수취인별로 주문을 그룹화하여 박스 계산"""
     orders = defaultdict(dict)
