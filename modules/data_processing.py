@@ -186,6 +186,19 @@ def get_product_quantities(order_products):
     
     return quantities
 
+def get_product_color(product_name):
+    """상품명에 따른 색상 반환"""
+    if "단호박식혜" in product_name:
+        return "#FFD700"  # 황금색
+    elif "수정과" in product_name:
+        return "#D2B48C"  # 갈색
+    elif "식혜" in product_name and "단호박" not in product_name:
+        return "#654321"  # 갈색
+    elif "플레인" in product_name or "쌀요거트" in product_name:
+        return "#F5F5F5"  # 밝은 회색
+    else:
+        return "#808080"  # 회색
+
 def calculate_box_for_order(quantities):
     """단일 주문에 대한 박스 계산 - 새로운 간단 규칙"""
     
