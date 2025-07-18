@@ -4,7 +4,6 @@ import re
 from collections import defaultdict
 import gc
 from modules.memory import MemoryManager
-from modules.utils import read_excel_file_safely
 
 # ---------------------------
 # 🔸 데이터 정제
