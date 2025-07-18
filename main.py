@@ -23,7 +23,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # 메모리 관리
-from modules.memory import MemoryManager, force_garbage_collection
+#from modules.memory import MemoryManager, force_garbage_collection
 
 # 설정 및 상수
 from config.constants import BOX_RULES, BOX_COST_ORDER, STOCK_THRESHOLDS, BOX_DESCRIPTIONS
