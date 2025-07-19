@@ -50,9 +50,6 @@ from modules.storage import (
     save_shipment_data, load_shipment_data,
     save_box_data, load_box_data,
     save_stock_data, load_stock_data,
-    get_usb_customer_history_path,
-    extract_customer_order_from_shipment,
-    create_customer_history_file, check_duplicate_orders,
     get_stock_product_keys, format_stock_display_time
 )
 
