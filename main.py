@@ -130,6 +130,10 @@ def safe_execute(func, error_message="처리 중 오류가 발생했습니다", 
 @handle_errors
 def analyze_customer_orders(customer_history_file, shipment_file):
     """고객 주문 이력 분석 - 메인 함수"""
+    history_df = None
+    shipment_df = None
+    results = None
+    
     try:
         # 1. 파일 읽기
         history_df = read_excel_file_safely(customer_history_file)
@@ -138,7 +142,7 @@ def analyze_customer_orders(customer_history_file, shipment_file):
         if history_df is None or shipment_df is None:
             return None
         
-        # 2. 데이터 검증
+        # 2. 데이터 검증 (기존 코드 유지)
         required_history_cols = ['주문자이름', '주문자전화번호', '상품이름', '상품수량']
         required_shipment_cols = ['주문자이름', '주문자전화번호1']
         
@@ -156,28 +160,31 @@ def analyze_customer_orders(customer_history_file, shipment_file):
         # 3. 고객 매칭 및 분석
         results = match_and_analyze_customers(history_df, shipment_df)
         
+        # ⭐ DataFrame을 결과에 포함 (누적 파일 생성용)
+        results['source_data'] = {
+            'history_df': history_df.copy(),
+            'shipment_df': shipment_df.copy()
+        }
+        
         return results
         
     except Exception as e:
         st.error(f"❌ 고객 분석 중 오류: {str(e)}")
-        logging.error(f"고객 분석 중 오류 발생 (민감정보 제외)")
+        logging.error("고객 분석 중 오류 발생 (민감정보 제외)")
         return None
 
     finally:
-        # 강제 메모리 정리
+        # 강제 메모리 정리는 마지막에 실행
         if history_df is not None:
             del history_df
         if shipment_df is not None:
             del shipment_df
-        if results is not None and 'history_df' in locals():
-            # 결과에 DataFrame 참조가 남아있을 수 있으므로 추가 정리
-            pass
         gc.collect()
         
-        # 추가 강제 정리 (개인정보 완전 삭제)
         import sys
         if hasattr(sys, '_clear_type_cache'):
             sys._clear_type_cache()
+
 
 def force_memory_cleanup(*variables):
     """개인정보 포함 변수들의 강제 메모리 정리"""
@@ -507,18 +514,55 @@ def display_customer_analysis(results):
         st.dataframe(new_df, use_container_width=True, hide_index=True)
     
     # 결과 다운로드 버튼
+    # 결과 다운로드 버튼 (기존 위치에서 수정)
     st.markdown("---")
     st.markdown("### 💾 분석 결과 다운로드")
-    
-    if st.button("📊 분석 결과 Excel 다운로드"):
-        output_file = create_analysis_report(results)
-        if output_file:
-            st.download_button(
-                label="📥 고객분석결과.xlsx 다운로드",
-                data=output_file,
-                file_name=f"고객분석결과_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+
+    # 2개의 다운로드 버튼 제공
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**📊 분석 결과 파일**")
+        if st.button("📈 분석결과.xlsx 다운로드", help="재주문고객 + 신규고객 분석 결과"):
+            output_file = create_analysis_report(results)
+            
+            if output_file:
+                st.download_button(
+                    label="📥 분석결과.xlsx",
+                    data=output_file,
+                    file_name=f"분석결과_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.success("✅ 분석 결과 파일이 준비되었습니다!")
+
+    with col2:
+        st.markdown("**📋 누적 고객정보 파일**")
+        if st.button("📁 고객주문정보_누적.xlsx 다운로드", help="다음날 업로드용 누적 데이터"):
+            # DataFrame 데이터 추출
+            history_df = results.get('source_data', {}).get('history_df')
+            shipment_df = results.get('source_data', {}).get('shipment_df')
+            
+            if history_df is not None and shipment_df is not None:
+                cumulative_file = create_updated_customer_file(history_df, shipment_df)
+                
+                if cumulative_file:
+                    st.download_button(
+                        label="📥 고객주문정보_누적.xlsx",
+                        data=cumulative_file,
+                        file_name=f"고객주문정보_누적_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    st.success("✅ 누적 고객정보 파일이 준비되었습니다!")
+            else:
+                st.error("❌ 누적 파일 생성에 필요한 데이터가 없습니다.")
+
+    st.info("""
+    📋 **파일 사용 가이드:**
+    - **분석결과.xlsx**: 재주문/신규 고객 분석 및 리포트용
+    - **고객주문정보_누적.xlsx**: 내일 고객분석 시 '고객주문정보 파일'로 업로드
+
+    💡 **다음 사용법**: '고객주문정보_누적.xlsx'를 다음날 고객주문정보 파일로 업로드하세요!
+    """)
 
         # 다운로드 후 메모리 정리
         if 'output_file' in locals():
@@ -527,7 +571,7 @@ def display_customer_analysis(results):
 
 
 def create_analysis_report(results):
-    """분석 결과를 Excel 파일로 생성"""
+    """분석 결과를 Excel 파일로 생성 (재주문고객 + 신규고객만)"""
     try:
         from io import BytesIO
         output = BytesIO()
@@ -568,8 +612,75 @@ def create_analysis_report(results):
         return output.getvalue()
     
     except Exception as e:
-        st.error(f"❌ Excel 파일 생성 실패: {str(e)}")
+        st.error(f"❌ 분석 결과 Excel 파일 생성 실패: {str(e)}")
         return None
+
+def create_updated_customer_file(history_df, shipment_df):
+    """기존 이력 + 오늘 출고내역 = 누적 고객주문정보 파일 생성"""
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        # 기존 고객주문정보 데이터 복사
+        updated_data = history_df.copy()
+        
+        # 오늘 출고내역을 고객주문정보 형식으로 변환
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        shipment_records = []
+        for _, row in shipment_df.iterrows():
+            # 출고내역서 → 고객주문정보 형식 변환
+            record = {
+                '주문일시': today,
+                '주문자이름': row.get('주문자이름', ''),
+                '주문자전화번호': row.get('주문자전화번호1', ''),
+                '상품이름': row.get('상품이름', ''),
+                '상품수량': row.get('상품수량', 1),
+                '상품결제금액': row.get('상품결제금액', 0),
+                '수취인이름': row.get('수취인이름', ''),
+                '옵션이름': row.get('옵션이름', '')
+            }
+            shipment_records.append(record)
+        
+        # 새로운 출고내역을 DataFrame으로 변환
+        new_records_df = pd.DataFrame(shipment_records)
+        
+        # 기존 데이터와 새로운 데이터 합치기
+        if not new_records_df.empty:
+            # 컬럼 순서 맞추기
+            common_columns = ['주문일시', '주문자이름', '주문자전화번호', '상품이름', 
+                            '상품수량', '상품결제금액', '수취인이름', '옵션이름']
+            
+            # 기존 데이터에서 공통 컬럼만 선택
+            history_subset = updated_data[common_columns].copy() if all(col in updated_data.columns for col in common_columns) else updated_data.copy()
+            
+            # 새로운 데이터 추가
+            final_data = pd.concat([history_subset, new_records_df], ignore_index=True)
+            
+            # 중복 제거 (동일한 고객이 같은 날 같은 상품을 주문한 경우)
+            final_data = final_data.drop_duplicates(
+                subset=['주문일시', '주문자이름', '주문자전화번호', '상품이름'], 
+                keep='last'
+            )
+            
+            # 날짜순 정렬
+            final_data['주문일시'] = pd.to_datetime(final_data['주문일시'], errors='coerce')
+            final_data = final_data.sort_values('주문일시', ascending=False)
+            final_data['주문일시'] = final_data['주문일시'].dt.strftime('%Y-%m-%d')
+        else:
+            final_data = updated_data
+        
+        # Excel 파일로 저장
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            final_data.to_excel(writer, sheet_name='고객주문정보', index=False)
+        
+        output.seek(0)
+        return output.getvalue()
+        
+    except Exception as e:
+        st.error(f"❌ 누적 고객 데이터 파일 생성 실패: {str(e)}")
+        return None
+
 
 def read_excel_file_safely(uploaded_file):
     """안전한 엑셀 파일 읽기 - 강화된 에러 처리"""
