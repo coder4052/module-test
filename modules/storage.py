@@ -187,8 +187,8 @@ def get_usb_customer_history_path(usb_path, year):
 def check_usb_connection():
     usb_paths = ['D:', 'E:', 'F:', 'G:', 'H:']
     for path in usb_paths:
-        # 반드시 드라이브 문자 뒤에 '\\' 붙이기
         real_path = path if path.endswith('\\') else path + '\\'
+        st.info(f"점검 중: {real_path} - {os.path.exists(real_path)}")
         if os.path.exists(real_path):
             return True, path
     return False, None
