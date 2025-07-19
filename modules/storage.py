@@ -185,17 +185,13 @@ def get_usb_customer_history_path(usb_path, year):
     return os.path.join(usb_path, f"고객주문정보_{year}.xlsx")
 
 def check_usb_connection():
-    usb_paths = [f"{letter}:\\" for letter in ['D', 'E', 'F', 'G', 'H']]
+    usb_paths = ['D:', 'E:', 'F:', 'G:', 'H:']
     for path in usb_paths:
-        if os.path.exists(path):
-            if st.session_state.get("admin_mode"):
-                st.info(f"✅ USB 드라이브 확인됨: {path}")
+        # 반드시 드라이브 문자 뒤에 '\\' 붙이기
+        real_path = path if path.endswith('\\') else path + '\\'
+        if os.path.exists(real_path):
             return True, path
-        else:
-            if st.session_state.get("admin_mode"):
-                st.warning(f"❌ USB 드라이브 없음: {path}")
     return False, None
-
 
 def extract_customer_order_from_shipment(df):
     """출고내역서에서 고객주문정보 추출 (USB용)"""
