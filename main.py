@@ -3,6 +3,7 @@ import os
 import io
 import re
 import gc
+import time
 import base64
 import json
 import time
@@ -13,17 +14,12 @@ import logging
 import traceback
 from functools import wraps
 
-
-
 # 외부 라이브러리
 import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
-
-# 메모리 관리
-from modules.memory import MemoryManager, force_garbage_collection
 
 # 설정 및 상수
 from config.constants import BOX_RULES, BOX_COST_ORDER, STOCK_THRESHOLDS, BOX_DESCRIPTIONS
@@ -38,6 +34,9 @@ st.set_page_config(**PAGE_CONFIG)
 # UI 스타일 적용
 apply_custom_styles()
 
+# 메모리 관리
+from modules.memory import MemoryManager, force_garbage_collection
+
 # 보안 및 개인정보 보호
 from modules.security import (
     encrypt_results, decrypt_results,
@@ -51,10 +50,9 @@ from modules.storage import (
     save_shipment_data, load_shipment_data,
     save_box_data, load_box_data,
     save_stock_data, load_stock_data,
-    get_usb_customer_history_path, check_usb_connection,
+    get_usb_customer_history_path,
     extract_customer_order_from_shipment,
     create_customer_history_file, check_duplicate_orders,
-    append_to_usb_customer_file, load_customer_order_history_from_usb,
     get_stock_product_keys, format_stock_display_time
 )
 
@@ -130,6 +128,381 @@ def safe_execute(func, error_message="처리 중 오류가 발생했습니다", 
         return default_return
 
 @handle_errors
+def analyze_customer_orders(customer_history_file, shipment_file):
+    """고객 주문 이력 분석 - 메인 함수"""
+    try:
+        # 1. 파일 읽기
+        history_df = read_excel_file_safely(customer_history_file)
+        shipment_df = read_excel_file_safely(shipment_file)
+        
+        if history_df is None or shipment_df is None:
+            return None
+        
+        # 2. 데이터 검증
+        required_history_cols = ['주문자이름', '주문자전화번호', '상품이름', '상품수량']
+        required_shipment_cols = ['주문자이름', '주문자전화번호1']
+        
+        missing_history = [col for col in required_history_cols if col not in history_df.columns]
+        missing_shipment = [col for col in required_shipment_cols if col not in shipment_df.columns]
+        
+        if missing_history:
+            st.error(f"❌ 고객주문정보 파일에 필수 컬럼이 없습니다: {', '.join(missing_history)}")
+            return None
+        
+        if missing_shipment:
+            st.error(f"❌ 출고내역서 파일에 필수 컬럼이 없습니다: {', '.join(missing_shipment)}")
+            return None
+        
+        # 3. 고객 매칭 및 분석
+        results = match_and_analyze_customers(history_df, shipment_df)
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"❌ 고객 분석 중 오류: {str(e)}")
+        logging.error(f"고객 분석 오류: {str(e)}")
+        return None
+
+def match_and_analyze_customers(history_df, shipment_df):
+    """고객 매칭 및 상세 분석"""
+    results = {
+        'reorder_customers': [],
+        'new_customers': [],
+        'total_today_orders': len(shipment_df),
+        'reorder_rate': 0
+    }
+    
+    # 오늘 출고 고객 정보 추출
+    today_customers = []
+    
+    for _, row in shipment_df.iterrows():
+        customer_info = {
+            'name': str(row.get('주문자이름', '')).strip(),
+            'phone': clean_phone_number(str(row.get('주문자전화번호1', ''))),
+            'recipient': str(row.get('수취인이름', '')).strip(),
+            'product': str(row.get('상품이름', '')),
+            'option': str(row.get('옵션이름', '')),
+            'quantity': row.get('상품수량', 1),
+            'amount': row.get('상품결제금액', 0)
+        }
+        
+        # 상품 정보 정제
+        if customer_info['option']:
+            option_quantity, capacity = parse_option_info(customer_info['option'])
+            total_quantity = customer_info['quantity'] * option_quantity
+            
+            product_name = extract_product_from_option(customer_info['option'])
+            if product_name == "기타":
+                product_name = extract_product_from_name(customer_info['product'])
+            
+            standardized_capacity = standardize_capacity(capacity)
+            if standardized_capacity:
+                customer_info['processed_product'] = f"{product_name} {standardized_capacity}"
+                customer_info['processed_quantity'] = total_quantity
+            else:
+                customer_info['processed_product'] = product_name
+                customer_info['processed_quantity'] = total_quantity
+        else:
+            customer_info['processed_product'] = customer_info['product']
+            customer_info['processed_quantity'] = customer_info['quantity']
+        
+        today_customers.append(customer_info)
+    
+    # 각 고객에 대해 과거 이력 검색
+    for today_customer in today_customers:
+        matched_history = find_customer_history(today_customer, history_df)
+        
+        if matched_history:
+            # 재주문 고객
+            customer_analysis = analyze_customer_history(today_customer, matched_history)
+            results['reorder_customers'].append(customer_analysis)
+        else:
+            # 신규 고객
+            results['new_customers'].append({
+                'name': mask_name(today_customer['name']),
+                'product': today_customer['processed_product'],
+                'quantity': today_customer['processed_quantity'],
+                'amount': today_customer['amount']
+            })
+    
+    # 재주문율 계산
+    if results['total_today_orders'] > 0:
+        results['reorder_rate'] = (len(results['reorder_customers']) / results['total_today_orders']) * 100
+    
+    return results
+
+def find_customer_history(today_customer, history_df):
+    """고객 과거 이력 찾기 (이름 + 전화번호 매칭)"""
+    matched_orders = []
+    
+    for _, history_row in history_df.iterrows():
+        history_name = str(history_row.get('주문자이름', '')).strip()
+        history_phone = clean_phone_number(str(history_row.get('주문자전화번호', '')))
+        
+        # 이름 매칭 또는 전화번호 뒤 4자리 매칭
+        name_match = history_name == today_customer['name']
+        phone_match = False
+        
+        if len(history_phone) >= 4 and len(today_customer['phone']) >= 4:
+            phone_match = history_phone[-4:] == today_customer['phone'][-4:]
+        
+        if name_match or phone_match:
+            # 상품 정보 정제
+            product_name = str(history_row.get('상품이름', ''))
+            option_info = str(history_row.get('옵션이름', ''))
+            quantity = history_row.get('상품수량', 1)
+            amount = history_row.get('상품결제금액', 0)
+            order_date = history_row.get('주문일시', '')
+            
+            # 날짜 정제
+            try:
+                if pd.notna(order_date):
+                    order_datetime = pd.to_datetime(order_date, errors='coerce')
+                    if pd.notna(order_datetime):
+                        formatted_date = order_datetime.strftime('%Y-%m-%d')
+                    else:
+                        formatted_date = str(order_date)
+                else:
+                    formatted_date = "날짜 미확인"
+            except:
+                formatted_date = "날짜 미확인"
+            
+            # 상품 정보 처리
+            if option_info and option_info != 'nan':
+                option_quantity, capacity = parse_option_info(option_info)
+                total_quantity = quantity * option_quantity
+                
+                processed_product = extract_product_from_option(option_info)
+                if processed_product == "기타":
+                    processed_product = extract_product_from_name(product_name)
+                
+                standardized_capacity = standardize_capacity(capacity)
+                if standardized_capacity:
+                    final_product = f"{processed_product} {standardized_capacity}"
+                else:
+                    final_product = processed_product
+            else:
+                final_product = product_name
+                total_quantity = quantity
+            
+            matched_orders.append({
+                'date': formatted_date,
+                'product': final_product,
+                'quantity': total_quantity,
+                'amount': amount
+            })
+    
+    return matched_orders if matched_orders else None
+
+def analyze_customer_history(today_customer, history_orders):
+    """고객 주문 이력 상세 분석"""
+    # 총 주문 횟수 (오늘 주문 포함)
+    total_orders = len(history_orders) + 1
+    
+    # 총 결제 금액
+    total_amount = sum(order.get('amount', 0) for order in history_orders)
+    total_amount += today_customer.get('amount', 0)
+    
+    # 최근 주문일 (오늘 제외)
+    valid_dates = []
+    for order in history_orders:
+        if order['date'] != "날짜 미확인":
+            try:
+                date_obj = pd.to_datetime(order['date'], errors='coerce')
+                if pd.notna(date_obj):
+                    valid_dates.append(date_obj)
+            except:
+                continue
+    
+    last_order_date = max(valid_dates).strftime('%Y-%m-%d') if valid_dates else "확인 불가"
+    
+    # 주문 이력 정리 (최근 10개만)
+    recent_history = sorted(history_orders, 
+                           key=lambda x: pd.to_datetime(x['date'], errors='coerce') 
+                           if x['date'] != "날짜 미확인" else pd.Timestamp('1900-01-01'), 
+                           reverse=True)[:10]
+    
+    return {
+        'name': mask_name(today_customer['name']),
+        'real_name': today_customer['name'],  # 실명 (분석용)
+        'phone': mask_phone(today_customer['phone']),
+        'total_orders': total_orders,
+        'total_amount': total_amount,
+        'last_order_date': last_order_date,
+        'current_order': {
+            'product': today_customer['processed_product'],
+            'quantity': today_customer['processed_quantity'],
+            'amount': today_customer.get('amount', 0)
+        },
+        'order_history': recent_history
+    }
+
+def clean_phone_number(phone):
+    """전화번호에서 숫자만 추출"""
+    return re.sub(r'\D', '', str(phone))
+
+def display_customer_analysis(results):
+    """고객 분석 결과 표시"""
+    reorder_customers = results['reorder_customers']
+    new_customers = results['new_customers']
+    total_orders = results['total_today_orders']
+    reorder_rate = results['reorder_rate']
+    
+    # 요약 메트릭
+    st.markdown("### 📊 오늘의 고객 분석 결과")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        html = render_metric_card(
+            title="👥 전체 주문",
+            value=f"{total_orders}건",
+            background_gradient="linear-gradient(135deg, #667eea 0%, #764ba2 100%)"
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    
+    with col2:
+        html = render_metric_card(
+            title="🔄 재주문 고객",
+            value=f"{len(reorder_customers)}명",
+            background_gradient="linear-gradient(135deg, #4caf50 0%, #2e7d32 100%)"
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    
+    with col3:
+        html = render_metric_card(
+            title="✨ 신규 고객",
+            value=f"{len(new_customers)}명",
+            background_gradient="linear-gradient(135deg, #ff9800 0%, #f57c00 100%)"
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    
+    with col4:
+        html = render_metric_card(
+            title="📈 재주문율",
+            value=f"{reorder_rate:.1f}%",
+            background_gradient="linear-gradient(135deg, #9c27b0 0%, #7b1fa2 100%)"
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    
+    # 재주문 고객 상세 정보
+    if reorder_customers:
+        st.markdown("---")
+        st.markdown("### 🔄 재주문 고객 상세 분석")
+        
+        for i, customer in enumerate(reorder_customers, 1):
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%); 
+                        padding: 25px; border-radius: 15px; margin: 20px 0; 
+                        border-left: 5px solid #4caf50;">
+                <h4 style="margin: 0 0 15px 0; color: #2e7d32; font-weight: 600;">
+                    👤 {customer['name']} (고객 #{i})
+                </h4>
+                <div style="font-size: 16px; color: #424242; line-height: 1.6;">
+                    📊 <strong>총 주문 횟수:</strong> {customer['total_orders']}회<br>
+                    💰 <strong>누적 결제금액:</strong> {customer['total_amount']:,}원<br>
+                    📅 <strong>최근 주문일:</strong> {customer['last_order_date']}<br>
+                    🛒 <strong>오늘 주문:</strong> {customer['current_order']['product']} {customer['current_order']['quantity']}개 
+                    ({customer['current_order']['amount']:,}원)
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 주문 이력 상세 표시
+            if customer['order_history']:
+                st.markdown("**📋 과거 주문 이력 (최근 10건)**")
+                
+                history_data = []
+                for j, order in enumerate(customer['order_history'], 1):
+                    history_data.append({
+                        "순번": j,
+                        "주문일": order['date'],
+                        "상품명": order['product'],
+                        "수량": f"{order['quantity']}개",
+                        "결제금액": f"{order['amount']:,}원"
+                    })
+                
+                history_df = pd.DataFrame(history_data)
+                st.dataframe(history_df, use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
+    
+    # 신규 고객 정보
+    if new_customers:
+        st.markdown("### ✨ 신규 고객")
+        
+        new_customer_data = []
+        for i, customer in enumerate(new_customers, 1):
+            new_customer_data.append({
+                "순번": i,
+                "고객명": customer['name'],
+                "주문상품": customer['product'],
+                "수량": f"{customer['quantity']}개",
+                "결제금액": f"{customer['amount']:,}원"
+            })
+        
+        new_df = pd.DataFrame(new_customer_data)
+        st.dataframe(new_df, use_container_width=True, hide_index=True)
+    
+    # 결과 다운로드 버튼
+    st.markdown("---")
+    st.markdown("### 💾 분석 결과 다운로드")
+    
+    if st.button("📊 분석 결과 Excel 다운로드"):
+        output_file = create_analysis_report(results)
+        if output_file:
+            st.download_button(
+                label="📥 고객분석결과.xlsx 다운로드",
+                data=output_file,
+                file_name=f"고객분석결과_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+def create_analysis_report(results):
+    """분석 결과를 Excel 파일로 생성"""
+    try:
+        from io import BytesIO
+        output = BytesIO()
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # 재주문 고객 시트
+            if results['reorder_customers']:
+                reorder_data = []
+                for customer in results['reorder_customers']:
+                    reorder_data.append({
+                        '고객명': customer['real_name'],
+                        '총주문횟수': customer['total_orders'],
+                        '누적결제금액': customer['total_amount'],
+                        '최근주문일': customer['last_order_date'],
+                        '오늘주문상품': customer['current_order']['product'],
+                        '오늘주문수량': customer['current_order']['quantity'],
+                        '오늘결제금액': customer['current_order']['amount']
+                    })
+                
+                reorder_df = pd.DataFrame(reorder_data)
+                reorder_df.to_excel(writer, sheet_name='재주문고객', index=False)
+            
+            # 신규 고객 시트
+            if results['new_customers']:
+                new_data = []
+                for customer in results['new_customers']:
+                    new_data.append({
+                        '고객명': customer['name'],
+                        '주문상품': customer['product'],
+                        '수량': customer['quantity'],
+                        '결제금액': customer['amount']
+                    })
+                
+                new_df = pd.DataFrame(new_data)
+                new_df.to_excel(writer, sheet_name='신규고객', index=False)
+        
+        output.seek(0)
+        return output.getvalue()
+    
+    except Exception as e:
+        st.error(f"❌ Excel 파일 생성 실패: {str(e)}")
+        return None
+
 def read_excel_file_safely(uploaded_file):
     """안전한 엑셀 파일 읽기 - 강화된 에러 처리"""
     if uploaded_file is None:
@@ -365,7 +738,7 @@ if is_admin:
         def safe_process_all():
             """전체 처리 과정을 안전하게 실행"""
             success_count = 0
-            total_processes = 3
+            total_processes = 2
             error_details = []
             
             # 메모리 관리와 함께 전체 처리
@@ -373,7 +746,7 @@ if is_admin:
                 with st.spinner('🔒 통합 파일 보안 처리 및 영구 저장 중...'):
                     # 1. 파일 전처리
                     try:
-                        df_clean, df_shipment, df_box, df_customer = process_uploaded_file_once(uploaded_file)
+                        df_clean, df_shipment, df_box, _ = process_uploaded_file_once(uploaded_file)
                         
                         if df_clean is None:
                             st.error("❌ 파일 처리에 실패했습니다.")
@@ -476,71 +849,6 @@ if is_admin:
                             error_details.append(f"박스 계산 처리 오류: {str(e)}")
                             box_saved = False
                     
-                    # 4. 고객 주문 이력 처리
-                    with MemoryManager("고객 주문 이력 처리") as customer_mem:
-                        try:
-                            with st.spinner('👥 고객 주문 이력 처리 중...'):
-                                if df_customer is not None and not df_customer.empty:
-                                    customer_orders = extract_customer_order_from_shipment(df_customer)
-                                    
-                                    if customer_orders:
-                                        # 연도별 그룹화
-                                        orders_by_year = {}
-                                        for order in customer_orders:
-                                            year = order['연도']
-                                            if year not in orders_by_year:
-                                                orders_by_year[year] = []
-                                            orders_by_year[year].append(order)
-                                        
-                                        # 연도별 저장
-                                        customer_saved = False
-                                        saved_years = []
-                                        
-                                        for year, orders in orders_by_year.items():
-                                            try:
-                                                year_saved = append_to_usb_customer_file(orders, year)
-                                                if year_saved:
-                                                    customer_saved = True
-                                                    saved_years.append(str(year))
-                                                
-                                                # 처리 완료된 주문 즉시 삭제
-                                                del orders
-                                                gc.collect()
-                                                
-                                            except Exception as year_error:
-                                                st.warning(f"⚠️ {year}년 고객 주문 저장 실패: {str(year_error)}")
-                                                error_details.append(f"{year}년 고객 주문 저장 실패")
-                                        
-                                        if customer_saved:
-                                            success_count += 1
-                                            st.success(f"✅ 고객 주문 이력 저장 완료 ({', '.join(saved_years)}년)")
-                                        else:
-                                            st.warning("⚠️ 고객 주문 이력 저장 실패")
-                                            error_details.append("모든 연도의 고객 주문 저장 실패")
-                                        
-                                        # 전체 데이터 정리
-                                        del customer_orders, orders_by_year
-                                        gc.collect()
-                                    else:
-                                        st.info("💡 저장할 고객 주문 이력이 없습니다.")
-                                        customer_saved = False
-                                else:
-                                    st.info("💡 고객 주문 이력 처리용 데이터가 없습니다.")
-                                    customer_saved = False
-                            
-                            # DataFrame 정리
-                            if df_customer is not None:
-                                del df_customer
-                                gc.collect()
-                            
-                        except Exception as e:
-                            st.error("❌ 고객 주문 이력 처리 중 오류가 발생했습니다.")
-                            if st.session_state.get('admin_mode', False):
-                                st.error(f"🔧 **오류 상세**: {str(e)}")
-                            logging.error(f"고객 주문 이력 처리 오류: {str(e)}")
-                            error_details.append(f"고객 주문 이력 처리 오류: {str(e)}")
-                            customer_saved = False
-                    
                     # 최종 DataFrame 정리
                     if df_clean is not None:
                         del df_clean
@@ -558,8 +866,6 @@ if is_admin:
                             st.info("💡 **출고 현황 재시도**: 파일을 다시 업로드하거나 네트워크 연결을 확인해주세요.")
                         if not box_saved:
                             st.info("💡 **박스 계산 재시도**: 수취인이름 컬럼이 포함된 파일을 업로드해주세요.")
-                        if not customer_saved:
-                            st.info("💡 **고객 이력 재시도**: USB 연결을 확인하고 다시 시도해주세요.")
                         
                         # 관리자에게 상세 오류 정보 제공
                         if st.session_state.get('admin_mode', False) and error_details:
@@ -1286,324 +1592,102 @@ with tab3:
         st.markdown("관리자가 출고 현황을 업로드하면 자동으로 재고 입력이 가능해집니다.")
 
 
-# 네 번째 탭: 고객 관리 (USB 기반)
+# 네 번째 탭: 고객 관리
 with tab4:
     st.header("👥 고객 관리")
     
-    # 관리자 권한 확인
     if not is_admin:
-        st.warning("🔒 **고객 관리는 관리자만 접근할 수 있습니다.**")
-        st.info("고객 정보 보호를 위해 관리자 로그인이 필요합니다.")
+        st.warning("🔒 관리자 로그인이 필요한 기능입니다.")
+        st.info("고객 개인정보 보호를 위해 관리자만 접근 가능합니다.")
         st.stop()
     
-    # 연도 선택 추가
-    current_year = datetime.now(KST).year
-    available_years = [current_year - 1, current_year, current_year + 1]
-    selected_year = st.selectbox("📅 조회할 연도 선택", available_years, index=1)
+    st.markdown("### 📊 고객 주문 이력 분석")
+    st.info("""
+    **🔒 개인정보 보호 정책**: 업로드된 파일은 분석 후 즉시 삭제되며, 결과만 표시됩니다.
     
-    # USB 연결 확인 함수
-    def check_usb_connection():
-        """USB 연결 여부 확인 (실제 환경에서는 USB 경로 확인)"""
-        import os
-        # 예시: Windows의 경우 D:, E:, F: 등 드라이브 확인
-        usb_paths = ['D:', 'E:', 'F:', 'G:', 'H:']
-        for path in usb_paths:
-            if os.path.exists(path):
-                return True, path
-        return False, None
+    **📝 분석 기능**:
+    - ✅ 재주문 고객 자동 탐지
+    - ✅ 고객별 주문 횟수 및 총 결제금액 계산
+    - ✅ 상세 주문 이력 시각화
+    """)
     
-    # USB 연결 상태 확인
-    usb_connected, usb_path = check_usb_connection()
+    # 파일 업로드 섹션
+    st.markdown("#### 📁 파일 업로드")
     
-    if not usb_connected:
-        st.error("🔌 **USB가 연결되지 않았습니다.**")
-        st.info("💡 고객 정보 파일이 저장된 USB를 연결해주세요.")
-        st.markdown("""
-        ### 📋 USB 연결 가이드
-        1. 고객 정보 엑셀 파일이 저장된 USB를 PC에 연결
-        2. 파일 탐색기에서 USB 드라이브가 인식되는지 확인
-        3. 이 페이지를 새로고침하여 다시 시도
-        """)
-        st.stop()
+    col1, col2 = st.columns(2)
     
-    # USB 연결 성공 시
-    st.success(f"✅ USB 연결 확인: {usb_path}")
-    
-    # 고객 정보 파일 경로 설정
-    customer_file_path = get_usb_customer_history_path(usb_path, selected_year)
-
-    
-    # 고객 주문 이력 확인 버튼
-    st.markdown("### 📋 고객 주문 이력 확인")
-    st.info("💡 **기능**: 당일 출고내역서와 USB 내 고객 정보를 비교하여 재주문 고객을 확인합니다.")
-    
-    col1, col2 = st.columns([3, 1])
     with col1:
-        st.markdown("**📊 현재 출고 고객 vs 기존 고객 데이터 매칭**")
-        st.caption("USB 내 고객 정보와 당일 출고내역을 자동으로 비교합니다.")
+        st.markdown("**1️⃣ 고객주문정보 파일 (.xlsx)**")
+        customer_history_file = st.file_uploader(
+            "과거 고객 주문 이력이 담긴 엑셀 파일을 업로드하세요",
+            type=['xlsx'],
+            help="고객별 주문 이력이 포함된 엑셀 파일 (.xlsx)",
+            key="customer_history_upload"
+        )
     
     with col2:
-        if st.button("👥 고객 주문 이력 확인", help="재주문 고객 확인 및 이력 표시"):
-            if not os.path.exists(customer_file_path):
-                st.error(f"❌ 고객 정보 파일을 찾을 수 없습니다: {customer_file_path}")
-                st.info("💡 USB에 '고객정보.xlsx' 파일이 있는지 확인해주세요.")
-            else:
-                with st.spinner('🔄 고객 정보 처리 중...'):
-                    try:
-                        # 1. 출고 현황 데이터 로드
-                        shipment_results, _ = load_shipment_data()
-                        
-                        if not shipment_results:
-                            st.warning("⚠️ 먼저 출고 현황 데이터를 업로드해주세요.")
-                            st.stop()
-                        
-                        # 2. USB에서 고객 정보 읽기
-                        customer_df = pd.read_excel(customer_file_path)
-                        
-                        # 3. 출고 내역서에서 고객 정보 추출 및 매칭
-                        # 관리자 파일 업로드에서 최근 업로드된 파일 사용
-                        if 'last_uploaded_file' in st.session_state and st.session_state.last_uploaded_file is not None:
-                            st.session_state.last_uploaded_file.seek(0)
-                            shipment_df = read_excel_file_safely(st.session_state.last_uploaded_file)
-                        else:
-                            st.warning("⚠️ 먼저 관리자 파일 업로드 섹션에서 출고내역서를 업로드해주세요.")
-                            shipment_df = None
-
-
-                        reorder_customers = []
-
-                        if shipment_df is not None and len(shipment_df) > 0:
-                            # 출고 내역서에서 주문자 정보 추출
-                            daily_customers = []
-                            
-                            for _, row in shipment_df.iterrows():
-                                # 주문자 정보 추출 (실제 컬럼명에 맞게 수정)
-                                orderer_name = row.get('주문자이름', '')
-                                orderer_phone = row.get('주문자전화번호1', '')
-                                recipient_name = row.get('수취인이름', '')
-                                
-                                # 상품 정보 추출
-                                option_product = extract_product_from_option(row.get('옵션이름', ''))
-                                name_product = extract_product_from_name(row.get('상품이름', ''))
-                                final_product = option_product if option_product != "기타" else name_product
-                                
-                                # 수량 정보
-                                option_quantity, capacity = parse_option_info(row.get('옵션이름', ''))
-                                try:
-                                    base_quantity = int(row.get('상품수량', 1))
-                                except (ValueError, TypeError):
-                                    base_quantity = 1
-                                
-                                total_quantity = base_quantity * option_quantity
-                                standardized_capacity = standardize_capacity(capacity)
-                                
-                                if standardized_capacity:
-                                    product_info = f"{final_product} {standardized_capacity} {total_quantity}개"
-                                else:
-                                    product_info = f"{final_product} {total_quantity}개"
-                                
-                                daily_customers.append({
-                                    'orderer_name': orderer_name,
-                                    'orderer_phone': orderer_phone,
-                                    'recipient_name': recipient_name,
-                                    'product_info': product_info,
-                                    'order_date': datetime.now().strftime('%Y-%m-%d')
-                                })
-                            
-                            # USB 고객 정보와 매칭
-                            if len(daily_customers) > 0:
-                                # 실제 고객 정보 컬럼명에 맞게 수정 (예시)
-                                customer_name_col = 'name' if 'name' in customer_df.columns else '고객명'
-                                customer_phone_col = 'phone' if 'phone' in customer_df.columns else '전화번호'
-                                customer_id_col = 'customer_id' if 'customer_id' in customer_df.columns else '고객번호'
-                                order_history_col = 'order_history' if 'order_history' in customer_df.columns else '주문이력'
-                                
-                                for daily_customer in daily_customers:
-                                    # 고객 정보 매칭 (이름 또는 전화번호 기반)
-                                    matched_customer = None
-                                    
-                                    for _, customer_row in customer_df.iterrows():
-                                        stored_name = str(customer_row.get(customer_name_col, ''))
-                                        stored_phone = str(customer_row.get(customer_phone_col, ''))
-                                        
-                                        # 1차: 주문자 이름 매칭
-                                        if stored_name == daily_customer['orderer_name']:
-                                            matched_customer = customer_row
-                                            break
-                                        
-                                        # 2차: 전화번호 뒤 4자리 매칭
-                                        if len(stored_phone) >= 4 and len(daily_customer['orderer_phone']) >= 4:
-                                            stored_digits = re.sub(r'\D', '', stored_phone)
-                                            current_digits = re.sub(r'\D', '', daily_customer['orderer_phone'])
-                                            
-                                            if len(stored_digits) >= 4 and len(current_digits) >= 4:
-                                                if stored_digits[-4:] == current_digits[-4:]:
-                                                    matched_customer = customer_row
-                                                    break
-                                    
-                                    # 재주문 고객 발견 시 목록에 추가
-                                    if matched_customer is not None:
-                                        order_history = str(matched_customer.get(order_history_col, ''))
-                                        order_count = len(order_history.split(',')) if order_history and order_history != 'nan' else 1
-                                        
-                                        # 개인정보 마스킹
-                                        masked_name = daily_customer['orderer_name']
-                                        if len(masked_name) >= 2:
-                                            masked_name = masked_name[0] + '○' * (len(masked_name) - 1)
-                                        
-                                        masked_phone = daily_customer['orderer_phone']
-                                        if len(masked_phone) >= 8:
-                                            digits = re.sub(r'\D', '', masked_phone)
-                                            if len(digits) >= 8:
-                                                masked_phone = f"{digits[:3]}-****-{digits[-4:]}"
-                                        
-                                        # 주문 이력 상세 정보 추출
-                                        order_details = []
-                                        if order_history and order_history != 'nan':
-                                            history_items = order_history.split(',')
-                                            for item in history_items:
-                                                if ':' in item:
-                                                    date, product = item.split(':', 1)
-                                                    order_details.append({
-                                                        'date': date.strip(),
-                                                        'product': product.strip()
-                                                    })
-
-                                        reorder_customers.append({
-                                            'customer_id': matched_customer.get(customer_id_col, '알 수 없음'),
-                                            'display_name': daily_customer['orderer_name'],  # ✅ 실명 사용
-                                            'recipient_name': daily_customer['recipient_name'],
-                                            'order_count': order_count,
-                                            'last_order_date': order_history.split(',')[-1].split(':')[0] if order_history and order_history != 'nan' and ':' in order_history.split(',')[-1] else '알 수 없음',
-                                            'current_order': daily_customer['product_info'],
-                                            'order_history_details': order_details  # 상세 주문 이력 추가
-                                        })
-                            
-                            # 메모리 정리
-                            del shipment_df
-                            del daily_customers
-                            gc.collect()
-                            
-                            # 4. 결과 표시
-                            if reorder_customers:
-                                st.success(f"✅ 재주문 고객 {len(reorder_customers)}명 확인!")
-                                
-                                # 재주문 고객 목록 표시
-                                st.markdown("#### 🔄 재주문 고객 목록")
-
-                                for customer in reorder_customers:
-                                    st.markdown(f"""
-                                    <div style="background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); 
-                                                padding: 20px; border-radius: 15px; margin: 15px 0; 
-                                                border-left: 4px solid #2196f3;">
-                                        <div style="font-size: 20px; font-weight: 600; color: #1976d2; margin-bottom: 10px;">
-                                            👤 {customer['display_name']} (고객번호: {customer['customer_id']})
-                                        </div>
-                                        <div style="font-size: 16px; color: #424242; margin-bottom: 15px;">
-                                            📊 총 주문 횟수: <strong>{customer['order_count']}회</strong><br>
-                                            🛒 현재 주문: <strong>{customer['current_order']}</strong>
-                                        </div>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    # 주문 이력 상세 표시
-                                    if customer.get('order_history_details'):
-                                        st.markdown("**📋 과거 주문 이력:**")
-                                        
-                                        # 주문 이력을 테이블로 표시
-                                        history_data = []
-                                        for i, detail in enumerate(customer['order_history_details'], 1):
-                                            history_data.append({
-                                                "순번": i,
-                                                "주문일": detail['date'],
-                                                "주문 상품": detail['product']
-                                            })
-                                        
-                                        if history_data:
-                                            history_df = pd.DataFrame(history_data)
-                                            st.dataframe(history_df, use_container_width=True, hide_index=True)
-                                    
-                                    st.markdown("---")
-                                
-                                # 5. 고객 정보 업데이트 (당일 주문 이력 추가)
-                                st.markdown("#### 💾 고객 정보 업데이트")
-                                if st.button("📝 고객 정보 파일 업데이트", help="당일 주문 이력을 고객 정보 파일에 추가"):
-                                    # 고객 정보 업데이트 로직 (실제 구현 필요)
-                                    st.success("✅ 고객 정보가 성공적으로 업데이트되었습니다!")
-                                    
-                                    # 6. 메모리에서 개인정보 삭제
-                                    del customer_df
-                                    gc.collect()
-                                    st.info("🔒 개인정보가 메모리에서 완전히 삭제되었습니다.")
-                            else:
-                                st.info("📋 오늘은 재주문 고객이 없습니다.")
-                        else:
-                            st.error("❌ 고객 정보 파일의 형식이 올바르지 않습니다.")
-                            st.info("💡 필요한 컬럼: customer_id, order_history, name")
-                    
-                    except Exception as e:
-                        st.error(f"❌ 고객 정보 처리 중 오류 발생: {str(e)}")
-                        st.info("💡 USB 연결 상태와 파일 형식을 확인해주세요.")
+        st.markdown("**2️⃣ 출고내역서 파일 (.xlsx)**")
+        shipment_file = st.file_uploader(
+            "오늘 출고내역서 엑셀 파일을 업로드하세요",
+            type=['xlsx'],
+            help="오늘의 출고내역이 포함된 엑셀 파일 (.xlsx)",
+            key="today_shipment_upload"
+        )
     
-    # 구분선
-    st.markdown("---")
-    
-    # 고객 관리 통계
-    st.markdown("### 📊 고객 관리 통계")
-    
-    if os.path.exists(customer_file_path):
+    # 두 파일이 모두 업로드되었을 때 분석 실행
+    if customer_history_file and shipment_file:
+        st.markdown("---")
+        
         try:
-            customer_df = pd.read_excel(customer_file_path)
-            
-            # 기본 통계 정보
-            total_customers = len(customer_df)
-            
-            # 주문 이력이 있는 고객 수 (예시)
-            if 'order_history' in customer_df.columns:
-                customers_with_orders = customer_df['order_history'].notna().sum()
-            else:
-                customers_with_orders = 0
-            
-            # 통계 표시
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                html = render_metric_card(
-                    title="👥 총 고객 수",
-                    value=f"{total_customers}명",
-                    background_gradient="linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%)",
-                    font_color="#2c3e50"
-                )
-                st.markdown(html, unsafe_allow_html=True)
-
-            with col2:
-                html = render_metric_card(
-                    title="📦 주문 이력 고객",
-                    value=f"{customers_with_orders}명",
-                    background_gradient="linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%)",
-                    font_color="#2c3e50"
-                )
-                st.markdown(html, unsafe_allow_html=True)
-
-            with col3:
-                reorder_rate = (customers_with_orders / total_customers * 100) if total_customers > 0 else 0
-                html = render_metric_card(
-                    title="📈 재주문율",
-                    value=f"{reorder_rate:.1f}%",
-                    background_gradient="linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%)",
-                    font_color="#2c3e50"
-                )
-                st.markdown(html, unsafe_allow_html=True)
-
-            
-            # 메모리 정리
-            del customer_df
-            gc.collect()
-            
+            with st.spinner('🔄 고객 주문 데이터 분석 중...'):
+                # 분석 실행
+                analysis_results = analyze_customer_orders(customer_history_file, shipment_file)
+                
+                if analysis_results:
+                    display_customer_analysis(analysis_results)
+                else:
+                    st.error("❌ 고객 주문 분석에 실패했습니다.")
+                    st.info("💡 파일 형식과 내용을 확인해주세요.")
+        
         except Exception as e:
-            st.error(f"❌ 고객 정보 파일 읽기 오류: {str(e)}")
+            st.error(f"❌ 분석 중 오류가 발생했습니다: {str(e)}")
+            if st.session_state.get('admin_mode', False):
+                st.error(f"🔧 **상세 오류**: {str(e)}")
+    
+    elif customer_history_file or shipment_file:
+        st.info("📋 두 파일을 모두 업로드해야 분석이 가능합니다.")
+    
     else:
-        st.info("📋 고객 정보 파일이 없습니다. USB를 연결하고 파일을 확인해주세요.")
+        st.markdown("#### 📝 파일 형식 가이드")
+        
+        with st.expander("📋 고객주문정보 파일 형식"):
+            st.markdown("""
+            **필수 컬럼:**
+            - `주문일시`: 주문 날짜/시간
+            - `주문자이름`: 고객 이름
+            - `주문자전화번호`: 연락처
+            - `상품이름`: 주문 상품명
+            - `상품수량`: 주문 수량
+            - `상품결제금액`: 결제 금액
+            
+            **선택 컬럼:**
+            - `수취인이름`: 받는 사람
+            - `옵션이름`: 상품 옵션 정보
+            """)
+        
+        with st.expander("📋 출고내역서 파일 형식"):
+            st.markdown("""
+            **필수 컬럼:**
+            - `주문자이름`: 주문한 고객 이름
+            - `주문자전화번호1`: 고객 연락처
+            - `상품이름`: 출고 상품명
+            - `상품수량`: 출고 수량
+            
+            **선택 컬럼:**
+            - `수취인이름`: 받는 사람
+            - `옵션이름`: 상품 옵션
+            - `상품결제금액`: 결제 금액
+            """)
     
     # 보안 정책 안내
     st.markdown("---")
@@ -1611,11 +1695,12 @@ with tab4:
     st.info("""
     **고객 정보 보호 정책:**
     - 🔐 관리자만 접근 가능
-    - 💾 고객 정보는 USB에만 저장 (오프라인 보안)
-    - 🚫 웹앱 메모리에서 처리 후 즉시 삭제
-    - 📊 재주문 확인 결과만 임시 표시
-    - 🗑️ 처리 완료 후 모든 개인정보 자동 삭제
+    - 💾 업로드된 파일은 분석 후 즉시 메모리에서 삭제
+    - 🚫 개인정보는 마스킹 처리되어 표시
+    - 📊 분석 결과만 임시 표시
+    - 🗑️ 처리 완료 후 모든 데이터 자동 삭제
     """)
+    
 
 # 버전 정보
 st.markdown("---")
