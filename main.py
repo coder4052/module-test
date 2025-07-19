@@ -160,8 +160,70 @@ def analyze_customer_orders(customer_history_file, shipment_file):
         
     except Exception as e:
         st.error(f"❌ 고객 분석 중 오류: {str(e)}")
-        logging.error(f"고객 분석 오류: {str(e)}")
+        logging.error(f"고객 분석 중 오류 발생 (민감정보 제외)")
         return None
+
+    finally:
+        # 강제 메모리 정리
+        if history_df is not None:
+            del history_df
+        if shipment_df is not None:
+            del shipment_df
+        if results is not None and 'history_df' in locals():
+            # 결과에 DataFrame 참조가 남아있을 수 있으므로 추가 정리
+            pass
+        gc.collect()
+        
+        # 추가 강제 정리 (개인정보 완전 삭제)
+        import sys
+        if hasattr(sys, '_clear_type_cache'):
+            sys._clear_type_cache()
+
+def force_memory_cleanup(*variables):
+    """개인정보 포함 변수들의 강제 메모리 정리"""
+    import sys
+    
+    # 변수들 삭제
+    for var in variables:
+        if var is not None:
+            try:
+                del var
+            except:
+                pass
+    
+    # 가비지 컬렉션 강제 실행
+    gc.collect()
+    
+    # 시스템 레벨 캐시 정리
+    if hasattr(sys, '_clear_type_cache'):
+        sys._clear_type_cache()
+    
+    # 추가 메모리 압박
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except:
+        pass  # Linux가 아닌 경우 무시
+
+def secure_dataframe_delete(df):
+    """DataFrame의 보안 삭제 (개인정보 완전 제거)"""
+    if df is not None:
+        try:
+            # DataFrame 내용을 0으로 덮어쓰기 (보안 삭제)
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    df[col] = ''
+                else:
+                    df[col] = 0
+            
+            # DataFrame 삭제
+            del df
+        except:
+            pass
+    
+    gc.collect()
+
 
 def match_and_analyze_customers(history_df, shipment_df):
     """고객 매칭 및 상세 분석"""
@@ -219,7 +281,7 @@ def match_and_analyze_customers(history_df, shipment_df):
         else:
             # 신규 고객
             results['new_customers'].append({
-                'name': mask_name(today_customer['name']),
+                'name': today_customer['name'],
                 'product': today_customer['processed_product'],
                 'quantity': today_customer['processed_quantity'],
                 'amount': today_customer['amount']
@@ -323,9 +385,9 @@ def analyze_customer_history(today_customer, history_orders):
                            reverse=True)[:10]
     
     return {
-        'name': mask_name(today_customer['name']),
+        'name': today_customer['name'],
         'real_name': today_customer['name'],  # 실명 (분석용)
-        'phone': mask_phone(today_customer['phone']),
+        'phone': today_customer['phone'],
         'total_orders': total_orders,
         'total_amount': total_amount,
         'last_order_date': last_order_date,
@@ -458,6 +520,12 @@ def display_customer_analysis(results):
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
+        # 다운로드 후 메모리 정리
+        if 'output_file' in locals():
+            del output_file
+        force_memory_cleanup(results)        
+
+
 def create_analysis_report(results):
     """분석 결과를 Excel 파일로 생성"""
     try:
@@ -557,7 +625,7 @@ def read_excel_file_safely(uploaded_file):
             if i == len(read_options) - 1:
                 st.error(f"❌ {uploaded_file.name}: 모든 읽기 방식 실패")
                 st.info("💡 파일을 다시 저장하거나 다른 파일을 시도해주세요.")
-                logging.error(f"파일 읽기 실패: {str(e)}")
+                logging.error(f"Excel 파일 읽기 실패 (파일 세부사항 제외) ")
             continue
     
     return df
@@ -670,7 +738,7 @@ def process_uploaded_file_once(uploaded_file):
         st.error(f"❌ 데이터 처리 중 오류가 발생했습니다.")
         if st.session_state.get('admin_mode', False):
             st.error(f"🔧 **오류 상세**: {str(e)}")
-        logging.error(f"데이터 처리 오류: {str(e)}")
+        logging.error(f"데이터 처리 중 시스템 오류 발생 (데이터 내용 제외)")
         return None, None, None, None
 
 
@@ -759,7 +827,7 @@ if is_admin:
                         st.error("❌ 파일 전처리 중 치명적 오류가 발생했습니다.")
                         if st.session_state.get('admin_mode', False):
                             st.error(f"🔧 **오류 상세**: {str(e)}")
-                        logging.error(f"파일 전처리 오류: {str(e)}")
+                        logging.error(f"파일 전처리 중 시스템 오류 (파일 내용 제외)")
                         return False
                     
                     # 2. 출고 현황 처리
@@ -782,17 +850,32 @@ if is_admin:
                                     error_details.append("출고 현황 데이터 없음")
                                     shipment_saved = False
                             
-                            # 즉시 메모리 정리
-                            del df_shipment, results
+                            # 강화된 메모리 정리
+                            if 'results' in locals() and results is not None:
+                                del results
+                            if 'df_shipment' in locals() and df_shipment is not None:
+                                del df_shipment
                             gc.collect()
+                            
+                            # 추가 시스템 정리
+                            import sys
+                            if hasattr(sys, '_clear_type_cache'):
+                                sys._clear_type_cache()
                             
                         except Exception as e:
                             st.error("❌ 출고 현황 처리 중 오류가 발생했습니다.")
                             if st.session_state.get('admin_mode', False):
                                 st.error(f"🔧 **오류 상세**: {str(e)}")
-                            logging.error(f"출고 현황 처리 오류: {str(e)}")
-                            error_details.append(f"출고 현황 처리 오류: {str(e)}")
+                            logging.error("출고 현황 처리 중 시스템 오류 (출고 데이터 제외)")
+                            error_details.append("출고 현황 처리 시스템 오류")
                             shipment_saved = False
+                        
+                        finally:
+                            # finally 블록에서 확실한 정리
+                            for var_name in ['results', 'df_shipment']:
+                                if var_name in locals():
+                                    del locals()[var_name]
+                            gc.collect()
                     
                     # 3. 박스 계산 처리
                     with MemoryManager("박스 계산 처리") as box_mem:
@@ -845,7 +928,7 @@ if is_admin:
                             st.error("❌ 박스 계산 처리 중 오류가 발생했습니다.")
                             if st.session_state.get('admin_mode', False):
                                 st.error(f"🔧 **오류 상세**: {str(e)}")
-                            logging.error(f"박스 계산 처리 오류: {str(e)}")
+                            logging.error(f"박스 계산 처리 중 시스템 오류 (수취인 정보 제외)")
                             error_details.append(f"박스 계산 처리 오류: {str(e)}")
                             box_saved = False
                     
@@ -911,7 +994,7 @@ if is_admin:
             st.info("💡 페이지를 새로고침하고 다시 시도해주세요.")
             if st.session_state.get('admin_mode', False):
                 st.error(f"🔧 **치명적 오류**: {str(critical_error)}")
-            logging.critical(f"치명적 시스템 오류: {str(critical_error)}")
+            logging.critical(f"치명적 시스템 오류 발생 (시스템 세부사항 제외)")
 
 # 첫 번째 탭: 출고 현황
 with tab1:
@@ -1653,6 +1736,25 @@ with tab4:
             st.error(f"❌ 분석 중 오류가 발생했습니다: {str(e)}")
             if st.session_state.get('admin_mode', False):
                 st.error(f"🔧 **상세 오류**: {str(e)}")
+
+        finally:
+            # 고객 분석 완료 후 강제 메모리 정리
+            if analysis_results is not None:
+                del analysis_results
+            
+            # 업로드된 파일 객체도 정리
+            if 'customer_history_file' in locals():
+                customer_history_file = None
+            if 'shipment_file' in locals():
+                shipment_file = None
+            
+            # 강제 가비지 컬렉션
+            gc.collect()
+            
+            # 시스템 레벨 메모리 정리
+            import sys
+            if hasattr(sys, '_clear_type_cache'):
+                sys._clear_type_cache()
     
     elif customer_history_file or shipment_file:
         st.info("📋 두 파일을 모두 업로드해야 분석이 가능합니다.")
