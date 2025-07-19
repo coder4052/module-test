@@ -564,10 +564,10 @@ def display_customer_analysis(results):
     💡 **다음 사용법**: '고객주문정보_누적.xlsx'를 다음날 고객주문정보 파일로 업로드하세요!
     """)
 
-        # 다운로드 후 메모리 정리
-        if 'output_file' in locals():
-            del output_file
-        force_memory_cleanup(results)        
+    # 다운로드 후 메모리 정리
+    if 'output_file' in locals():
+        del output_file
+    force_memory_cleanup(results)        
 
 
 def create_analysis_report(results):
